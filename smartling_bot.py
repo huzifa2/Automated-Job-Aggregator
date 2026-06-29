@@ -1,19 +1,17 @@
 """
-Smartling Auto-Accept Bot
-=========================
-يراقب صفحة الوظائف المتاحة على Smartling ويقبلها تلقائياً.
+Smartling Auto-Accept Bot v2
+============================
+يعمل بدون متصفح — يكلم الـ API مباشرة.
 
 الاستراتيجية:
-  1. تسجيل الدخول مرة واحدة وحفظ الجلسة (cookies + localStorage)
-  2. اعتراض network requests لمعرفة API endpoints الداخلية
-  3. استدعاء API مباشرة لجلب الوظائف وقبولها (أسرع من الواجهة)
-  4. إذا فشل API → fallback إلى automation عبر واجهة المستخدم
-
-الاستخدام:
-  python smartling_bot.py
+  1. تسجيل الدخول عبر Playwright مرة واحدة → جلب Cookie + Csrf-Token
+  2. حفظ الجلسة
+  3. كل X ثواني: استدعاء API الوظائف المتاحة مباشرة
+  4. لو في وظيفة → استدعاء API القبول مباشرة (أقل من ثانية)
+  5. لو انتهت الجلسة → تسجيل دخول تلقائي
 
 المتطلبات:
-  pip install playwright python-dotenv
+  pip install playwright python-dotenv requests
   playwright install chromium
 """
 
@@ -22,28 +20,38 @@ import json
 import logging
 import os
 import time
+import requests
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, Page, BrowserContext, Response
+from playwright.async_api import async_playwright
 
 # ─────────────────────────────────────────────
 # إعداد
 # ─────────────────────────────────────────────
 load_dotenv()
 
-EMAIL    = os.getenv("SMARTLING_EMAIL", "")
-PASSWORD = os.getenv("SMARTLING_PASSWORD", "")
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL", "15"))   # كل كم ثانية يتحقق
+EMAIL             = os.getenv("SMARTLING_EMAIL", "")
+PASSWORD          = os.getenv("SMARTLING_PASSWORD", "")
+CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL", "10"))
+LOCALE_ID         = os.getenv("LOCALE_ID", "ar-AE")
+WORKFLOW_STEP_UID = os.getenv("WORKFLOW_STEP_UID", "b9043c852bc5")
+TARGET_TASK_WORDS = int(os.getenv("TARGET_TASK_WORDS", "2000"))
+
 SESSION_FILE = Path("smartling_session.json")
 LOG_FILE     = Path("smartling_bot.log")
 
-JOBS_URL  = "https://dashboard.smartling.com/app/account-jobs/?filter=AVAILABLE_TO_ACCEPT"
-LOGIN_URL = "https://dashboard.smartling.com/app/login"
+LOGIN_URL  = "https://dashboard.smartling.com/app/login"
+JOBS_URL   = "https://dashboard.smartling.com/app/account-jobs/?filter=AVAILABLE_TO_ACCEPT"
+
+# API endpoints
+API_BASE         = "https://dashboard.smartling.com/p"
+API_JOBS_SEARCH  = f"{API_BASE}/jobs-api/v3/accounts/{{account_uid}}/jobs?limit=50&offset=0&sortBy=createdDate&sortDirection=DESC&translationJobStatus=AWAITING_AUTHORIZATIONS,IN_PROGRESS&assignedToCurrentUser=false"
+API_CLAIM        = f"{API_BASE}/content-assignments-api/v2/projects/{{project_uid}}/claiming/tasks/create"
 
 # ─────────────────────────────────────────────
-# Logging مزدوج: ملف + شاشة
+# Logging
 # ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -59,404 +67,339 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # حفظ واسترجاع الجلسة
 # ─────────────────────────────────────────────
-async def save_session(context: BrowserContext):
-    storage = await context.storage_state()
-    SESSION_FILE.write_text(json.dumps(storage, ensure_ascii=False, indent=2))
+def save_session(cookie_str: str, csrf_token: str, account_uid: str, project_uid: str):
+    data = {
+        "cookie": cookie_str,
+        "csrf_token": csrf_token,
+        "account_uid": account_uid,
+        "project_uid": project_uid,
+        "saved_at": time.time()
+    }
+    SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
     log.info("✅ تم حفظ الجلسة.")
 
 
-async def load_session(playwright) -> tuple:
-    """يُعيد (browser, context). يستخدم جلسة محفوظة إن وُجدت."""
-    browser = await playwright.chromium.launch(
-        headless=True,          # True للتشغيل في الخلفية، False للمشاهدة
-        args=["--no-sandbox"],
-    )
-    if SESSION_FILE.exists():
-        storage = json.loads(SESSION_FILE.read_text())
-        context = await browser.new_context(storage_state=storage)
-        log.info("📂 تم تحميل الجلسة المحفوظة.")
-    else:
+def load_session():
+    if not SESSION_FILE.exists():
+        return None
+    data = json.loads(SESSION_FILE.read_text())
+    # الجلسة صالحة لمدة 12 ساعة
+    if time.time() - data.get("saved_at", 0) > 43200:
+        log.info("⏰ انتهت صلاحية الجلسة المحفوظة.")
+        return None
+    log.info("📂 تم تحميل الجلسة المحفوظة.")
+    return data
+
+
+# ─────────────────────────────────────────────
+# تسجيل الدخول وجلب الـ tokens
+# ─────────────────────────────────────────────
+async def do_login() -> dict | None:
+    log.info("🔐 تسجيل الدخول...")
+    intercepted = {}
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context()
-        log.info("🆕 جلسة جديدة (لا توجد جلسة محفوظة).")
-    return browser, context
+        page    = await context.new_page()
+
+        # اعتراض الـ requests لجلب الـ account_uid و project_uid
+        async def on_request(request):
+            url = request.url
+            # جلب الـ account_uid من jobs API
+            if "jobs-api" in url and "accounts" in url and "account_uid" not in intercepted:
+                import re
+                m = re.search(r'/accounts/([^/]+)/', url)
+                if m:
+                    intercepted["account_uid"] = m.group(1)
+                    log.info(f"✅ account_uid: {intercepted['account_uid']}")
+
+            # جلب الـ project_uid من claiming API
+            if "content-assignments-api" in url and "projects" in url and "project_uid" not in intercepted:
+                import re
+                m = re.search(r'/projects/([^/]+)/', url)
+                if m:
+                    intercepted["project_uid"] = m.group(1)
+                    log.info(f"✅ project_uid: {intercepted['project_uid']}")
+
+        page.on("request", lambda r: asyncio.create_task(on_request(r)))
+
+        try:
+            # تسجيل الدخول
+            await page.goto(LOGIN_URL, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(1)
+
+            # إدخال الإيميل
+            email_sel = 'input[type="email"], input[name="email"], input[id*="email"], input[placeholder*="mail"]'
+            await page.fill(email_sel, EMAIL)
+            await asyncio.sleep(0.3)
+
+            # إدخال كلمة المرور
+            await page.fill('input[type="password"]', PASSWORD)
+            await asyncio.sleep(0.3)
+
+            # الضغط على تسجيل الدخول
+            await page.click('button[type="submit"]')
+            await page.wait_for_url("**/dashboard**", timeout=20000)
+            log.info("✅ تسجيل الدخول نجح.")
+
+            # فتح صفحة الوظائف لاعتراض الـ UIDs
+            await page.goto(JOBS_URL, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(3)
+
+            # جلب الـ cookies
+            cookies = await context.cookies()
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies
+                                     if "smartling.com" in c.get("domain", "")])
+
+            # جلب الـ CSRF token من الصفحة
+            csrf_token = await page.evaluate("""
+                () => {
+                    // من الـ meta tag
+                    const meta = document.querySelector('meta[name="csrf-token"]');
+                    if (meta) return meta.content;
+
+                    // من الـ cookies
+                    const cookies = document.cookie.split(';');
+                    for (const c of cookies) {
+                        const [k, v] = c.trim().split('=');
+                        if (k.toLowerCase().includes('csrf')) return v;
+                    }
+                    return null;
+                }
+            """)
+
+            # جلب الـ CSRF من الـ request headers المعترضة
+            if not csrf_token:
+                # انتظر request وجلب الـ CSRF منه
+                await asyncio.sleep(2)
+
+            log.info(f"🔑 CSRF Token: {csrf_token[:20] if csrf_token else 'لم يُجلب'}...")
+
+            await browser.close()
+
+            if not cookie_str:
+                log.error("❌ لم يتم جلب الـ cookies.")
+                return None
+
+            return {
+                "cookie": cookie_str,
+                "csrf_token": csrf_token or "",
+                "account_uid": intercepted.get("account_uid", ""),
+                "project_uid": intercepted.get("project_uid", "0af7edb35"),  # من الـ API اللي شفناه
+            }
+
+        except Exception as e:
+            log.error(f"❌ خطأ في تسجيل الدخول: {e}")
+            await page.screenshot(path="login_error.png")
+            await browser.close()
+            return None
 
 
 # ─────────────────────────────────────────────
-# تسجيل الدخول
+# جلب الجلسة (محفوظة أو جديدة)
 # ─────────────────────────────────────────────
-async def login(page: Page) -> bool:
-    log.info("🔐 محاولة تسجيل الدخول...")
+async def get_session() -> dict | None:
+    session = load_session()
+    if session:
+        # تحقق إن الجلسة لا تزال صالحة
+        if test_session(session):
+            return session
+        log.info("⚠️ الجلسة المحفوظة منتهية، إعادة تسجيل الدخول...")
+
+    session = await do_login()
+    if session:
+        save_session(
+            session["cookie"],
+            session["csrf_token"],
+            session["account_uid"],
+            session["project_uid"]
+        )
+    return session
+
+
+def test_session(session: dict) -> bool:
+    """تحقق من أن الجلسة لا تزال صالحة."""
     try:
-        await page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
-
-        # حقل الإيميل
-        await page.fill('input[type="email"], input[name="email"], input[placeholder*="mail"]', EMAIL)
-        await page.press('input[type="email"], input[name="email"], input[placeholder*="mail"]', "Tab")
-        await asyncio.sleep(0.5)
-
-        # حقل كلمة المرور
-        await page.fill('input[type="password"]', PASSWORD)
-        await asyncio.sleep(0.3)
-
-        # زر الدخول
-        await page.click('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")')
-        await page.wait_for_url("**/dashboard**", timeout=20_000)
-
-        log.info("✅ تسجيل الدخول نجح.")
-        return True
-
-    except Exception as e:
-        log.error(f"❌ فشل تسجيل الدخول: {e}")
-        await page.screenshot(path="login_error.png")
+        headers = build_headers(session)
+        r = requests.get(
+            "https://dashboard.smartling.com/p/preferences-api/v2/preferences/job-searches",
+            headers=headers,
+            timeout=10
+        )
+        return r.status_code == 200
+    except Exception:
         return False
 
 
 # ─────────────────────────────────────────────
-# اعتراض API وجلب الوظائف مباشرة
+# بناء الـ Headers
 # ─────────────────────────────────────────────
-class SmartlingAPIInterceptor:
-    """
-    يراقب network requests لمعرفة الـ API endpoints التي يستخدمها الموقع.
-    بعدها نستدعيها مباشرة بدون فتح المتصفح في كل مرة.
-    """
-
-    def __init__(self):
-        self.jobs_api_url: str | None = None
-        self.accept_api_template: str | None = None
-        self.auth_headers: dict = {}
-        self.captured = False
-
-    async def on_response(self, response: Response):
-        url = response.url
-        # ابحث عن الـ API calls المتعلقة بالوظائف
-        if "api.smartling.com" in url or "smartling.com" in url:
-            if any(k in url for k in ["jobs", "account-jobs", "available", "tasks"]):
-                try:
-                    body = await response.json()
-                    if body and "response" in body:
-                        log.debug(f"🌐 API intercepted: {url}")
-                        if not self.jobs_api_url:
-                            self.jobs_api_url = url
-                            self.captured = True
-                            log.info(f"✅ تم رصد Jobs API: {url}")
-                except Exception:
-                    pass
-
-    def attach(self, page: Page):
-        page.on("response", lambda r: asyncio.create_task(self.on_response(r)))
+def build_headers(session: dict) -> dict:
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Cookie": session["cookie"],
+        "Csrf-Token": session["csrf_token"],
+        "Origin": "https://dashboard.smartling.com",
+        "Referer": "https://dashboard.smartling.com/app/account-jobs/?filter=AVAILABLE_TO_ACCEPT",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
 
 
 # ─────────────────────────────────────────────
 # جلب الوظائف المتاحة
 # ─────────────────────────────────────────────
-async def fetch_available_jobs(page: Page, interceptor: SmartlingAPIInterceptor) -> list[dict]:
-    """
-    يحاول جلب الوظائف عبر API مباشرة أولاً.
-    إن لم يكن API معروفاً بعد، يفتح صفحة الوظائف ويحللها.
-    """
-    log.info("🔍 البحث عن وظائف متاحة...")
+def fetch_available_jobs(session: dict) -> list[dict]:
+    """يجلب الوظائف المتاحة مباشرة من الـ API."""
+    headers = build_headers(session)
+    account_uid = session.get("account_uid", "")
 
-    # فتح صفحة الوظائف (لضمان تحديث الجلسة وتشغيل network calls)
-    try:
-        await page.goto(JOBS_URL, wait_until="networkidle", timeout=30_000)
-        await asyncio.sleep(2)  # انتظار تحميل React
-    except Exception as e:
-        log.warning(f"⚠️ تعذر فتح صفحة الوظائف: {e}")
+    if not account_uid:
+        log.warning("⚠️ account_uid غير معروف، سيتم تحديثه عند أول تسجيل دخول.")
         return []
 
-    # حاول قراءة الوظائف من DOM
-    jobs = await extract_jobs_from_dom(page)
-    return jobs
-
-
-async def extract_jobs_from_dom(page: Page) -> list[dict]:
-    """يستخرج بيانات الوظائف من صفحة HTML."""
-    jobs = []
-    try:
-        # انتظر ظهور العناصر
-        await page.wait_for_selector(
-            '[class*="job"], [data-qa*="job"], [class*="row"], li[class*="item"]',
-            timeout=10_000,
-        )
-    except Exception:
-        log.warning("⚠️ لم تظهر عناصر الوظائف في الصفحة.")
-        return []
+    url = f"https://dashboard.smartling.com/p/jobs-api/v3/accounts/{account_uid}/jobs?limit=50&offset=0&sortBy=createdDate&sortDirection=DESC&translationJobStatus=AWAITING_AUTHORIZATIONS&assignedToCurrentUser=false"
 
     try:
-        # استخراج الوظائف عبر JavaScript
-        jobs_data = await page.evaluate("""
-            () => {
-                const results = [];
-                
-                // محاولة 1: ابحث عن زر Accept في الصفحة
-                const acceptBtns = document.querySelectorAll(
-                    'button[data-qa*="accept"], button[class*="accept"], button:not([disabled])'
-                );
-                
-                acceptBtns.forEach((btn, i) => {
-                    const text = btn.textContent?.trim() || '';
-                    if (text.toLowerCase().includes('accept') || text.toLowerCase().includes('claim')) {
-                        // ابحث عن الـ container الأب للحصول على اسم الوظيفة
-                        const row = btn.closest('[class*="row"], [class*="job"], li, tr') || btn.parentElement;
-                        const jobName = row?.querySelector('[class*="name"], [class*="title"], h3, h4, strong')?.textContent?.trim() || `Job ${i+1}`;
-                        
-                        results.push({
-                            index: i,
-                            jobName: jobName,
-                            hasAcceptBtn: true
-                        });
-                    }
-                });
-                
-                return results;
-            }
-        """)
+        r = requests.get(url, headers=headers, timeout=10)
 
-        if jobs_data:
-            log.info(f"📋 وُجد {len(jobs_data)} وظيفة متاحة.")
-            for j in jobs_data:
-                log.info(f"   • {j.get('jobName', 'بدون اسم')}")
-        else:
-            log.info("📭 لا توجد وظائف متاحة الآن.")
+        if r.status_code == 401:
+            log.warning("⚠️ انتهت الجلسة (401).")
+            return []
 
-        return jobs_data if jobs_data else []
+        if r.status_code != 200:
+            log.warning(f"⚠️ API رجع {r.status_code}: {r.text[:200]}")
+            return []
+
+        data = r.json()
+        jobs = data.get("response", {}).get("data", {}).get("items", [])
+        return jobs
 
     except Exception as e:
-        log.error(f"❌ خطأ في استخراج الوظائف: {e}")
+        log.error(f"❌ خطأ في جلب الوظائف: {e}")
         return []
 
 
 # ─────────────────────────────────────────────
-# قبول الوظيفة
+# قبول الوظيفة مباشرة عبر API
 # ─────────────────────────────────────────────
-async def accept_job(page: Page, job: dict) -> bool:
-    """
-    يقبل وظيفة واحدة عبر واجهة المستخدم:
-    1. اضغط Accept
-    2. في الـ popup: حدد الكل
-    3. اضغط زر القبول النهائي
-    """
-    job_name = job.get("jobName", "مجهولة")
-    log.info(f"🎯 محاولة قبول الوظيفة: {job_name}")
+def accept_job(session: dict, job: dict) -> bool:
+    """يقبل الوظيفة مباشرة بدون متصفح."""
+    headers  = build_headers(session)
+    project_uid      = job.get("projectId") or session.get("project_uid", "")
+    job_uid          = job.get("translationJobUid", "")
+    job_name         = job.get("jobName", "مجهولة")
+
+    if not project_uid or not job_uid:
+        log.error(f"❌ بيانات ناقصة: project={project_uid}, job={job_uid}")
+        return False
+
+    url = f"https://dashboard.smartling.com/p/content-assignments-api/v2/projects/{project_uid}/claiming/tasks/create"
+
+    payload = {
+        "localeId": LOCALE_ID,
+        "workflowStepUid": WORKFLOW_STEP_UID,
+        "translationJobUid": job_uid,
+        "targetTaskWords": TARGET_TASK_WORDS
+    }
+
+    log.info(f"🎯 قبول الوظيفة: {job_name} ({job_uid})")
 
     try:
-        # ─── الخطوة 1: اضغط زر Accept ─────────────────────────────
-        accept_clicked = await page.evaluate("""
-            (jobIndex) => {
-                const acceptBtns = Array.from(document.querySelectorAll(
-                    'button[data-qa*="accept"], button[class*="accept"], button'
-                )).filter(btn => {
-                    const t = btn.textContent?.trim().toLowerCase();
-                    return (t === 'accept' || t === 'claim' || t?.includes('accept')) && !btn.disabled;
-                });
-                
-                if (acceptBtns[jobIndex]) {
-                    acceptBtns[jobIndex].click();
-                    return true;
-                }
-                return false;
-            }
-        """, job["index"])
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
 
-        if not accept_clicked:
-            log.warning(f"⚠️ لم يتم العثور على زر Accept للوظيفة: {job_name}")
-            return False
-
-        # ─── الخطوة 2: انتظر الـ popup ────────────────────────────
-        await asyncio.sleep(1.5)
-
-        # تحقق من ظهور popup/dialog
-        popup_appeared = await page.evaluate("""
-            () => {
-                const modals = document.querySelectorAll(
-                    '[class*="modal"], [class*="dialog"], [class*="popup"], [role="dialog"]'
-                );
-                return modals.length > 0;
-            }
-        """)
-
-        if popup_appeared:
-            log.info("📦 ظهر popup التأكيد.")
-
-            # ─── الخطوة 3: حدد الكل (Select All) ─────────────────
-            select_all_clicked = await page.evaluate("""
-                () => {
-                    // ابحث عن checkbox "تحديد الكل"
-                    const selectAll = document.querySelector(
-                        'input[type="checkbox"][id*="all"], input[type="checkbox"][class*="all"], ' +
-                        'label:has-text("all") input, [data-qa*="select-all"], [data-qa*="selectAll"]'
-                    );
-                    
-                    if (selectAll && !selectAll.checked) {
-                        selectAll.click();
-                        return 'clicked_select_all';
-                    }
-                    
-                    // بديل: حدد كل checkboxes بشكل فردي
-                    const checkboxes = document.querySelectorAll(
-                        '[class*="modal"] input[type="checkbox"], [role="dialog"] input[type="checkbox"]'
-                    );
-                    
-                    if (checkboxes.length > 0) {
-                        let clicked = 0;
-                        checkboxes.forEach(cb => {
-                            if (!cb.checked) { cb.click(); clicked++; }
-                        });
-                        return `clicked_${clicked}_checkboxes`;
-                    }
-                    
-                    return 'nothing_found';
-                }
-            """)
-
-            log.info(f"☑️ تحديد الملفات: {select_all_clicked}")
-            await asyncio.sleep(0.8)
-
-            # ─── الخطوة 4: اضغط زر القبول النهائي ────────────────
-            confirmed = await page.evaluate("""
-                () => {
-                    const modal = document.querySelector(
-                        '[class*="modal"], [role="dialog"], [class*="popup"]'
-                    );
-                    if (!modal) return false;
-                    
-                    // ابحث عن زر الموافقة (وليس الإلغاء)
-                    const buttons = modal.querySelectorAll('button:not([disabled])');
-                    const confirmBtn = Array.from(buttons).find(btn => {
-                        const t = btn.textContent?.trim().toLowerCase();
-                        return (
-                            t === 'accept' ||
-                            t === 'confirm' ||
-                            t === 'ok' ||
-                            t === 'claim' ||
-                            t?.includes('accept') ||
-                            t?.includes('confirm')
-                        ) && !t?.includes('cancel') && !t?.includes('close');
-                    });
-                    
-                    if (confirmBtn) {
-                        confirmBtn.click();
-                        return true;
-                    }
-                    return false;
-                }
-            """)
-
-            if confirmed:
+        if r.status_code in [200, 201]:
+            data = r.json()
+            code = data.get("response", {}).get("code", "")
+            if code == "SUCCESS":
                 log.info(f"✅ تم قبول الوظيفة بنجاح: {job_name}")
-                await asyncio.sleep(2)
                 return True
             else:
-                log.warning(f"⚠️ لم يتم العثور على زر التأكيد في الـ popup")
-                await page.screenshot(path=f"popup_debug_{int(time.time())}.png")
+                log.warning(f"⚠️ الاستجابة: {code} — {r.text[:300]}")
                 return False
 
+        elif r.status_code == 401:
+            log.warning("⚠️ انتهت الجلسة أثناء القبول.")
+            return False
+
         else:
-            # لا يوجد popup → قد تكون الوظيفة قُبلت مباشرة
-            log.info(f"ℹ️ لا popup ظهر → قد تمت العملية مباشرة لـ: {job_name}")
-            return True
+            log.warning(f"⚠️ فشل القبول ({r.status_code}): {r.text[:300]}")
+            return False
 
     except Exception as e:
-        log.error(f"❌ خطأ أثناء قبول الوظيفة '{job_name}': {e}")
-        await page.screenshot(path=f"error_{int(time.time())}.png")
+        log.error(f"❌ خطأ أثناء قبول الوظيفة: {e}")
         return False
 
 
 # ─────────────────────────────────────────────
-# التحقق من صلاحية الجلسة
-# ─────────────────────────────────────────────
-async def is_logged_in(page: Page) -> bool:
-    try:
-        await page.goto(JOBS_URL, wait_until="domcontentloaded", timeout=15_000)
-        # إذا أُعيد توجيهنا لصفحة تسجيل الدخول
-        if "login" in page.url or "signin" in page.url:
-            return False
-        return True
-    except Exception:
-        return False
-
-
-# ─────────────────────────────────────────────
-# حلقة المراقبة الرئيسية
+# الحلقة الرئيسية
 # ─────────────────────────────────────────────
 async def monitor_loop():
-    """الحلقة الرئيسية التي تعمل 24/7."""
-
     if not EMAIL or not PASSWORD:
         log.error("❌ يجب ضبط SMARTLING_EMAIL و SMARTLING_PASSWORD في ملف .env")
         return
 
-    log.info("🚀 بدء تشغيل Smartling Bot...")
-    log.info(f"⏱️  فترة الفحص: كل {CHECK_INTERVAL_SECONDS} ثانية")
+    log.info("🚀 بدء تشغيل Smartling Bot v2 (API Mode)")
+    log.info(f"⏱️  فترة الفحص: كل {CHECK_INTERVAL} ثانية")
+    log.info(f"🌍 اللغة: {LOCALE_ID}")
 
+    session       = None
     accepted_total = 0
+    session_errors = 0
 
-    async with async_playwright() as playwright:
-        browser, context = await load_session(playwright)
-
+    while True:
         try:
-            page = await context.new_page()
+            # جلب أو تجديد الجلسة
+            if session is None or session_errors >= 3:
+                session = await get_session()
+                session_errors = 0
+                if not session:
+                    log.error("❌ فشل تسجيل الدخول. انتظار دقيقة...")
+                    await asyncio.sleep(60)
+                    continue
 
-            # إعداد interceptor
-            interceptor = SmartlingAPIInterceptor()
-            interceptor.attach(page)
+            loop_start = datetime.now()
+            log.info(f"🔄 [{loop_start.strftime('%H:%M:%S')}] فحص الوظائف...")
 
-            # تحقق من تسجيل الدخول
-            logged_in = await is_logged_in(page)
-            if not logged_in:
-                success = await login(page)
-                if not success:
-                    log.error("❌ فشل تسجيل الدخول. أوقف البرنامج.")
-                    return
-                await save_session(context)
+            # جلب الوظائف
+            jobs = fetch_available_jobs(session)
 
-            log.info("✅ جاهز للمراقبة!")
-            log.info("━" * 50)
+            if jobs is None or (isinstance(jobs, list) and len(jobs) == 0
+                                and session_errors > 0):
+                session_errors += 1
+            else:
+                session_errors = 0
 
-            while True:
-                loop_start = datetime.now()
-                log.info(f"🔄 [{loop_start.strftime('%H:%M:%S')}] فحص الوظائف...")
+            if jobs:
+                log.info(f"🎉 وُجد {len(jobs)} وظيفة!")
+                for job in jobs:
+                    success = accept_job(session, job)
+                    if success:
+                        accepted_total += 1
+                        log.info(f"📊 إجمالي الوظائف المقبولة: {accepted_total}")
+                    elif not success:
+                        # قد تكون الجلسة انتهت
+                        session_errors += 1
 
-                # تجديد الجلسة إن انتهت
-                if "login" in page.url or "signin" in page.url:
-                    log.warning("⚠️ انتهت الجلسة! إعادة تسجيل الدخول...")
-                    success = await login(page)
-                    if not success:
-                        log.error("❌ فشل إعادة تسجيل الدخول.")
-                        await asyncio.sleep(60)
-                        continue
-                    await save_session(context)
+            else:
+                log.info(f"😴 لا وظائف. انتظار {CHECK_INTERVAL}ث...")
 
-                # جلب الوظائف
-                jobs = await fetch_available_jobs(page, interceptor)
-
-                if jobs:
-                    log.info(f"🎉 وُجد {len(jobs)} وظيفة! بدء القبول...")
-                    for job in jobs:
-                        success = await accept_job(page, job)
-                        if success:
-                            accepted_total += 1
-                            log.info(f"📊 إجمالي الوظائف المقبولة: {accepted_total}")
-
-                    # بعد القبول، أعد تحميل الصفحة للتحقق
-                    await asyncio.sleep(3)
-                    await page.reload(wait_until="networkidle")
-
-                else:
-                    log.info(f"😴 لا وظائف الآن. انتظار {CHECK_INTERVAL_SECONDS}ث...")
-
-                # انتظر للفحص القادم
-                elapsed = (datetime.now() - loop_start).seconds
-                wait_time = max(1, CHECK_INTERVAL_SECONDS - elapsed)
-                await asyncio.sleep(wait_time)
+            # انتظار الفحص التالي
+            elapsed = (datetime.now() - loop_start).total_seconds()
+            wait    = max(1, CHECK_INTERVAL - elapsed)
+            await asyncio.sleep(wait)
 
         except KeyboardInterrupt:
-            log.info("🛑 تم إيقاف البرنامج بواسطة المستخدم.")
+            log.info("🛑 تم الإيقاف.")
+            break
+        except Exception as e:
+            log.error(f"❌ خطأ غير متوقع: {e}")
+            await asyncio.sleep(30)
 
-        finally:
-            await save_session(context)
-            await browser.close()
-            log.info(f"📊 الإجمالي النهائي: {accepted_total} وظيفة مقبولة")
+    log.info(f"📊 الإجمالي النهائي: {accepted_total} وظيفة مقبولة")
 
 
 # ─────────────────────────────────────────────
