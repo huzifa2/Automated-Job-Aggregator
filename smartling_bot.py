@@ -34,10 +34,8 @@ load_dotenv()
 
 EMAIL             = os.getenv("SMARTLING_EMAIL", "")
 PASSWORD          = os.getenv("SMARTLING_PASSWORD", "")
-CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL", "10"))
-LOCALE_ID         = os.getenv("LOCALE_ID", "ar-AE")
-WORKFLOW_STEP_UID = os.getenv("WORKFLOW_STEP_UID", "b9043c852bc5")
-TARGET_TASK_WORDS = int(os.getenv("TARGET_TASK_WORDS", "2000"))
+CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL", "5"))
+
 
 SESSION_FILE = Path("smartling_session.json")
 LOG_FILE     = Path("smartling_bot.log")
