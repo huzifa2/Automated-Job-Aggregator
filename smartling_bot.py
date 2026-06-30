@@ -264,7 +264,7 @@ async def monitor_loop():
                 # تحديث الصفحة
                 try:
                     await page.goto(JOBS_URL, wait_until="networkidle", timeout=20000)
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(10)
                 except Exception as e:
                     log.warning(f"⚠️ خطأ في تحميل الصفحة: {e}")
                     await asyncio.sleep(10)
@@ -280,7 +280,7 @@ async def monitor_loop():
                         log.info(f"📊 الإجمالي: {accepted_total} وظيفة")
                         # أعد تحميل الصفحة للبحث عن وظائف أخرى
                         await page.goto(JOBS_URL, wait_until="networkidle", timeout=20000)
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(10)
                     else:
                         break  # مفيش وظايف أو فشل
 
